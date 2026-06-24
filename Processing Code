@@ -1,0 +1,747 @@
+// Military-Grade Tactical Radar System — FIXED (Non-blocking TTS + Thread-safe)
+import processing.serial.*;
+import java.util.*;
+import java.util.concurrent.*;
+
+Serial myPort;
+
+// ============ CONFIGURATION ============
+final String COM_PORT = "COM3";
+final int BAUD_RATE = 9600;
+
+// ============ RADAR GEOMETRY ============
+float radarCenterX, radarCenterY;
+float radarRadius;
+final int MAX_RANGE_CM = 40;
+final int[] RANGE_RINGS_CM = {10, 20, 30, 40};
+
+// ============ DATA ============
+String data = "";
+volatile int iAngle = 0, iDistance = 0;
+volatile int rawAngle = 0, rawDistance = 0;
+
+// ============ THREAT SYSTEM ============
+CopyOnWriteArrayList<Threat> threats = new CopyOnWriteArrayList<Threat>();
+CopyOnWriteArrayList<Track> tracks = new CopyOnWriteArrayList<Track>();
+volatile boolean threatActive = false;
+volatile int threatAngle = 0, threatDistance = 0;
+volatile int threatStartTime = 0;
+final int THREAT_DISPLAY_MS = 3000;
+final int TRACK_MAX_AGE = 8000;
+
+// ============ TTS (Non-blocking) ============
+volatile boolean ttsReady = true;
+volatile int lastTTSTime = 0;
+final int TTS_COOLDOWN = 4000;
+
+// ============ VISUAL STATE ============
+float sweepAngle = 0;
+float sweepSpeed = 3.0;
+PFont fontMono, fontHUD, fontTitle;
+int lastFrameTime = 0;
+
+// ============ COLOR PALETTE ============
+final color COLOR_BG = color(5, 8, 12);
+final color COLOR_GRID = color(20, 40, 30);
+final color COLOR_GRID_BRIGHT = color(40, 80, 60);
+final color COLOR_SWEEP = color(50, 255, 100, 180);
+final color COLOR_SWEEP_CORE = color(150, 255, 180, 220);
+final color COLOR_TRACE = color(100, 255, 150, 120);
+final color COLOR_BLIP = color(0, 255, 100);
+final color COLOR_BLIP_FADE = color(0, 200, 80, 150);
+final color COLOR_TEXT_MAIN = color(180, 255, 200);
+final color COLOR_TEXT_DIM = color(100, 160, 120);
+final color COLOR_TEXT_ALERT = color(255, 60, 60);
+final color COLOR_TEXT_WARN = color(255, 180, 60);
+final color COLOR_PANEL_BG = color(8, 15, 12, 220);
+final color COLOR_PANEL_BORDER = color(30, 60, 45);
+final color COLOR_THREAT_ZONE = color(255, 30, 30, 40);
+
+// ============ UI LAYOUT ============
+float panelLeft, panelRight, panelTop, panelBottom;
+float sidebarWidth;
+
+// ============ SYSTEM STATUS ============
+volatile String systemStatus = "ONLINE";
+volatile int targetCount = 0;
+volatile float systemUptime = 0;
+
+// ============ THREADING ============
+ExecutorService ttsExecutor = Executors.newSingleThreadExecutor();
+final Object trackLock = new Object();
+
+// ============================================================
+// SETUP
+// ============================================================
+
+void setup() {
+  size(1400, 900);
+  smooth(8);
+  
+  radarCenterX = width * 0.42;
+  radarCenterY = height * 0.52;
+  radarRadius = min(width, height) * 0.38;
+  
+  panelLeft = width * 0.78;
+  panelRight = width - 20;
+  panelTop = 60;
+  panelBottom = height - 40;
+  sidebarWidth = panelRight - panelLeft;
+  
+  fontMono = createFont("Consolas", 14);
+  fontHUD = createFont("Arial Bold", 16);
+  fontTitle = createFont("Arial Black", 24);
+  
+  try {
+    myPort = new Serial(this, COM_PORT, BAUD_RATE);
+    myPort.bufferUntil('.');
+    systemStatus = "ONLINE";
+  } catch (Exception e) {
+    systemStatus = "NO SERIAL";
+    println("Serial error: " + e.getMessage());
+  }
+  
+  textAlign(LEFT, TOP);
+  lastFrameTime = millis();
+}
+
+// ============================================================
+// MAIN LOOP
+// ============================================================
+
+void draw() {
+  int now = millis();
+  float dt = (now - lastFrameTime) / 1000.0;
+  lastFrameTime = now;
+  systemUptime += dt;
+  
+  sweepAngle = (sweepAngle + sweepSpeed) % 360;
+  
+  background(COLOR_BG);
+  
+  drawGrid();
+  drawRangeRings();
+  drawBearingLines();
+  drawTracks();
+  drawSweep();
+  drawBlips();
+  drawThreatOverlay();
+  drawHUD();
+  drawSidebar();
+  drawHeader();
+  drawFooter();
+  
+  cleanupTracks(now);
+}
+
+// ============================================================
+// RADAR DISPLAY
+// ============================================================
+
+void drawGrid() {
+  stroke(COLOR_GRID);
+  strokeWeight(1);
+  
+  float gridSize = 30;
+  for (float x = 0; x < width; x += gridSize) {
+    line(x, 0, x, height);
+  }
+  for (float y = 0; y < height; y += gridSize) {
+    line(0, y, width, y);
+  }
+  
+  noStroke();
+  fill(8, 18, 12);
+  ellipse(radarCenterX, radarCenterY, radarRadius * 2.1, radarRadius * 2.1);
+  
+  noFill();
+  strokeWeight(2);
+  stroke(40, 100, 70);
+  ellipse(radarCenterX, radarCenterY, radarRadius * 2, radarRadius * 2);
+}
+
+void drawRangeRings() {
+  noFill();
+  strokeWeight(1.5);
+  
+  for (int range : RANGE_RINGS_CM) {
+    float r = map(range, 0, MAX_RANGE_CM, 0, radarRadius);
+    stroke(COLOR_GRID_BRIGHT);
+    ellipse(radarCenterX, radarCenterY, r * 2, r * 2);
+    
+    fill(COLOR_TEXT_DIM);
+    textFont(fontMono);
+    textSize(12);
+    textAlign(CENTER, CENTER);
+    text(range + "cm", radarCenterX, radarCenterY - r - 8);
+  }
+  
+  stroke(COLOR_GRID_BRIGHT);
+  strokeWeight(1);
+  float cross = 8;
+  line(radarCenterX - cross, radarCenterY, radarCenterX + cross, radarCenterY);
+  line(radarCenterX, radarCenterY - cross, radarCenterX, radarCenterY + cross);
+}
+
+void drawBearingLines() {
+  stroke(COLOR_GRID);
+  strokeWeight(1);
+  
+  int[] bearings = {0, 30, 60, 90, 120, 150, 180};
+  
+  for (int deg : bearings) {
+    float rad = radians(deg);
+    float x2 = radarCenterX + cos(rad) * radarRadius;
+    float y2 = radarCenterY - sin(rad) * radarRadius;
+    line(radarCenterX, radarCenterY, x2, y2);
+    
+    float lx = radarCenterX + cos(rad) * (radarRadius + 25);
+    float ly = radarCenterY - sin(rad) * (radarRadius + 25);
+    
+    fill(COLOR_TEXT_DIM);
+    textFont(fontMono);
+    textSize(13);
+    textAlign(CENTER, CENTER);
+    text(deg + "°", lx, ly);
+  }
+}
+
+void drawSweep() {
+  pushMatrix();
+  translate(radarCenterX, radarCenterY);
+  rotate(-radians(sweepAngle));
+  
+  noStroke();
+  
+  fill(30, 255, 80, 30);
+  beginShape();
+  vertex(0, 0);
+  vertex(radarRadius, -radarRadius * 0.15);
+  vertex(radarRadius, radarRadius * 0.15);
+  endShape(CLOSE);
+  
+  fill(COLOR_SWEEP);
+  beginShape();
+  vertex(0, 0);
+  vertex(radarRadius, -radarRadius * 0.08);
+  vertex(radarRadius, radarRadius * 0.08);
+  endShape(CLOSE);
+  
+  stroke(COLOR_SWEEP_CORE);
+  strokeWeight(2);
+  line(0, 0, radarRadius, 0);
+  
+  noStroke();
+  fill(COLOR_SWEEP_CORE);
+  ellipse(0, 0, 8, 8);
+  
+  popMatrix();
+}
+
+void drawBlips() {
+  if (rawDistance > 0 && rawDistance < MAX_RANGE_CM) {
+    float r = map(rawDistance, 0, MAX_RANGE_CM, 0, radarRadius);
+    float a = radians(rawAngle);
+    float bx = radarCenterX + cos(a) * r;
+    float by = radarCenterY - sin(a) * r;
+    
+    noStroke();
+    fill(0, 255, 100, 60);
+    ellipse(bx, by, 24, 24);
+    fill(0, 255, 100, 120);
+    ellipse(bx, by, 14, 14);
+    fill(200, 255, 220);
+    ellipse(bx, by, 6, 6);
+    
+    fill(COLOR_TEXT_MAIN);
+    textFont(fontMono);
+    textSize(11);
+    textAlign(LEFT, CENTER);
+    text(String.format("TGT %d° %dcm", rawAngle, rawDistance), bx + 15, by);
+  }
+}
+
+void drawTracks() {
+  for (Track t : tracks) {
+    float age = millis() - t.timestamp;
+    float life = 1.0 - (age / TRACK_MAX_AGE);
+    if (life < 0) continue;
+    
+    float r = map(t.distance, 0, MAX_RANGE_CM, 0, radarRadius);
+    float a = radians(t.angle);
+    float tx = radarCenterX + cos(a) * r;
+    float ty = radarCenterY - sin(a) * r;
+    
+    int alpha = int(255 * life * 0.7);
+    
+    if (t.history.size() > 1) {
+      noFill();
+      strokeWeight(2);
+      for (int i = 1; i < t.history.size(); i++) {
+        PVector p1 = t.history.get(i - 1);
+        PVector p2 = t.history.get(i);
+        float segLife = life * (float(i) / t.history.size());
+        stroke(100, 255, 150, int(150 * segLife));
+        line(p1.x, p1.y, p2.x, p2.y);
+      }
+    }
+    
+    noStroke();
+    fill(0, 255, 100, alpha);
+    ellipse(tx, ty, 10, 10);
+    
+    fill(COLOR_TEXT_DIM, alpha);
+    textFont(fontMono);
+    textSize(10);
+    textAlign(CENTER, CENTER);
+    text("T" + t.id, tx, ty - 14);
+  }
+}
+
+void drawThreatOverlay() {
+  if (!threatActive) return;
+  
+  int elapsed = millis() - threatStartTime;
+  if (elapsed > THREAT_DISPLAY_MS) {
+    threatActive = false;
+    return;
+  }
+  
+  float pulse = sin(elapsed * 0.008) * 0.5 + 0.5;
+  
+  noStroke();
+  fill(255, 20, 20, int(30 * pulse));
+  rect(0, 0, width, height);
+  
+  if (threatDistance > 0 && threatDistance < MAX_RANGE_CM) {
+    float r = map(threatDistance, 0, MAX_RANGE_CM, 0, radarRadius);
+    float a = radians(threatAngle);
+    float tx = radarCenterX + cos(a) * r;
+    float ty = radarCenterY - sin(a) * r;
+    
+    noFill();
+    strokeWeight(2);
+    for (int i = 0; i < 3; i++) {
+      float ringSize = 20 + i * 25 + pulse * 15;
+      stroke(255, 50, 50, int(150 * (1 - i * 0.3) * pulse));
+      ellipse(tx, ty, ringSize, ringSize);
+    }
+    
+    fill(255, 30, 30);
+    noStroke();
+    ellipse(tx, ty, 12, 12);
+    fill(255, 100, 100);
+    ellipse(tx, ty, 6, 6);
+  }
+}
+
+// ============================================================
+// HUD OVERLAYS
+// ============================================================
+
+void drawHUD() {
+  fill(COLOR_TEXT_DIM);
+  textFont(fontMono);
+  textSize(12);
+  textAlign(LEFT, TOP);
+  text(String.format("SCAN SECTOR: %03d°", int(sweepAngle)), 30, height - 100);
+  
+  float azRad = radians(sweepAngle);
+  float azX = radarCenterX + cos(azRad) * (radarRadius + 40);
+  float azY = radarCenterY - sin(azRad) * (radarRadius + 40);
+  
+  stroke(COLOR_SWEEP, 100);
+  strokeWeight(1);
+  line(radarCenterX, radarCenterY, azX, azY);
+}
+
+void drawHeader() {
+  noStroke();
+  fill(COLOR_PANEL_BG);
+  rect(0, 0, width, 50);
+  
+  stroke(COLOR_PANEL_BORDER);
+  strokeWeight(2);
+  line(0, 50, width, 50);
+  
+  fill(COLOR_TEXT_MAIN);
+  textFont(fontTitle);
+  textSize(22);
+  textAlign(LEFT, CENTER);
+  text("TACTICAL RADAR SYSTEM", 25, 25);
+  
+  textFont(fontMono);
+  textSize(12);
+  
+  if (systemStatus.equals("ONLINE")) {
+    fill(0, 255, 100);
+    ellipse(width - 180, 25, 10, 10);
+    fill(COLOR_TEXT_MAIN);
+    text("SYS: " + systemStatus, width - 165, 20);
+  } else {
+    fill(255, 100, 0);
+    ellipse(width - 180, 25, 10, 10);
+    fill(COLOR_TEXT_WARN);
+    text("SYS: " + systemStatus, width - 165, 20);
+  }
+  
+  fill(COLOR_TEXT_DIM);
+  textAlign(RIGHT, CENTER);
+  text(String.format("UPTIME: %02d:%02d:%02d", 
+    int(systemUptime / 3600),
+    int((systemUptime % 3600) / 60),
+    int(systemUptime % 60)), width - 25, 25);
+}
+
+void drawSidebar() {
+  noStroke();
+  fill(COLOR_PANEL_BG);
+  rect(panelLeft - 10, panelTop, sidebarWidth + 10, panelBottom - panelTop);
+  
+  stroke(COLOR_PANEL_BORDER);
+  strokeWeight(1);
+  line(panelLeft - 10, panelTop, panelLeft - 10, panelBottom);
+  
+  float y = panelTop + 20;
+  float x = panelLeft;
+  
+  fill(COLOR_TEXT_MAIN);
+  textFont(fontHUD);
+  textSize(14);
+  textAlign(LEFT, TOP);
+  text("THREAT STATUS", x, y);
+  y += 25;
+  
+  noStroke();
+  fill(20, 40, 30);
+  rect(x, y, sidebarWidth - 20, 8);
+  
+  if (threatActive) {
+    fill(255, 50, 50);
+    float barWidth = (sidebarWidth - 20) * (1.0 - (millis() - threatStartTime) / float(THREAT_DISPLAY_MS));
+    rect(x, y, max(0, barWidth), 8);
+  } else {
+    fill(0, 200, 80);
+    rect(x, y, sidebarWidth - 20, 8);
+  }
+  y += 25;
+  
+  if (threatActive) {
+    fill(COLOR_TEXT_ALERT);
+    textFont(fontMono);
+    textSize(13);
+    text("⚠ HOSTILE CONTACT", x, y);
+    y += 22;
+    fill(COLOR_TEXT_WARN);
+    text(String.format("AZM: %03d°", threatAngle), x, y);
+    y += 18;
+    text(String.format("RNG: %d cm", threatDistance), x, y);
+    y += 18;
+    text(String.format("CLS: %.1f m", threatDistance / 100.0), x, y);
+  } else {
+    fill(COLOR_TEXT_DIM);
+    textFont(fontMono);
+    textSize(13);
+    text("NO THREATS", x, y);
+  }
+  y += 40;
+  
+  stroke(COLOR_PANEL_BORDER);
+  strokeWeight(1);
+  line(x, y - 10, panelRight - 10, y - 10);
+  
+  fill(COLOR_TEXT_MAIN);
+  textFont(fontHUD);
+  textSize(14);
+  text("ACTIVE TRACKS (" + tracks.size() + ")", x, y);
+  y += 25;
+  
+  textFont(fontMono);
+  textSize(11);
+  
+  for (int i = tracks.size() - 1; i >= 0 && y < panelBottom - 100; i--) {
+    Track t = tracks.get(i);
+    float age = (millis() - t.timestamp) / 1000.0;
+    
+    if (t.isThreat) {
+      fill(COLOR_TEXT_ALERT);
+      text("!", x, y);
+    }
+    fill(COLOR_TEXT_DIM);
+    text(String.format("T%02d  %03d°  %02dcm  %.1fs", 
+      t.id, t.angle, t.distance, age), x + 12, y);
+    y += 18;
+  }
+  
+  if (tracks.isEmpty()) {
+    fill(COLOR_TEXT_DIM);
+    text("NO TRACKS", x, y);
+  }
+  y += 40;
+  
+  stroke(COLOR_PANEL_BORDER);
+  line(x, y - 10, panelRight - 10, y - 10);
+  
+  fill(COLOR_TEXT_MAIN);
+  textFont(fontHUD);
+  textSize(14);
+  text("SYSTEM LOG", x, y);
+  y += 25;
+  
+  textFont(fontMono);
+  textSize(11);
+  fill(COLOR_TEXT_DIM);
+  text("Serial: " + COM_PORT + " @ " + BAUD_RATE, x, y);
+  y += 18;
+  text("Range: 0-" + MAX_RANGE_CM + "cm", x, y);
+  y += 18;
+  text("Sweep: " + nf(sweepSpeed, 1, 1) + "°/frame", x, y);
+  y += 18;
+  text("TTS: " + (ttsReady ? "READY" : "COOLDOWN"), x, y);
+}
+
+void drawFooter() {
+  noStroke();
+  fill(COLOR_PANEL_BG);
+  rect(0, height - 35, width, 35);
+  
+  stroke(COLOR_PANEL_BORDER);
+  strokeWeight(1);
+  line(0, height - 35, width, height - 35);
+  
+  fill(COLOR_TEXT_DIM);
+  textFont(fontMono);
+  textSize(11);
+  textAlign(LEFT, CENTER);
+  
+  text(String.format("RAW: A=%03d° D=%02dcm | SWEEP=%03d° | TARGETS=%d", 
+    rawAngle, rawDistance, int(sweepAngle), tracks.size()), 25, height - 17);
+  
+  textAlign(RIGHT, CENTER);
+  text("[R] RESET TRACKS  |  [T] TEST THREAT  |  [S] TOGGLE SOUND", width - 25, height - 17);
+}
+
+// ============================================================
+// SERIAL & DATA (Thread-safe)
+// ============================================================
+
+void serialEvent(Serial myPort) {
+  data = myPort.readStringUntil('.');
+  if (data == null) return;
+  
+  data = data.substring(0, data.length() - 1).trim();
+  
+  if (data.startsWith("THREAT")) {
+    handleThreat(data.substring(7));
+  } else {
+    handleNormalData(data);
+  }
+}
+
+void handleNormalData(String data) {
+  int comma = data.indexOf(",");
+  if (comma < 0) return;
+  
+  try {
+    rawAngle = int(data.substring(0, comma));
+    rawDistance = int(data.substring(comma + 1));
+    iAngle = rawAngle;
+    iDistance = rawDistance;
+    
+    if (rawDistance > 0 && rawDistance < MAX_RANGE_CM) {
+      addTrack(rawAngle, rawDistance, false);
+    }
+  } catch (Exception e) {
+    // Invalid data
+  }
+}
+
+void handleThreat(String threatData) {
+  int comma = threatData.indexOf(",");
+  if (comma < 0) return;
+  
+  try {
+    int newThreatAngle = int(threatData.substring(0, comma));
+    int newThreatDistance = int(threatData.substring(comma + 1));
+    
+    threatAngle = newThreatAngle;
+    threatDistance = newThreatDistance;
+    threatActive = true;
+    threatStartTime = millis();
+    
+    iAngle = threatAngle;
+    iDistance = threatDistance;
+    
+    addTrack(threatAngle, threatDistance, true);
+    
+    // Non-blocking TTS
+    if (ttsReady && millis() - lastTTSTime > TTS_COOLDOWN) {
+      lastTTSTime = millis();
+      ttsReady = false;
+      final String msg = "Hostile contact, bearing " + threatAngle + ", range " + threatDistance + " centimeters";
+      
+      ttsExecutor.execute(new Runnable() {
+        public void run() {
+          runTTS(msg);
+          ttsReady = true;
+        }
+      });
+    }
+    
+    println("THREAT: " + threatAngle + "° " + threatDistance + "cm");
+  } catch (Exception e) {
+    // Invalid threat data
+  }
+}
+
+void addTrack(int angle, int distance, boolean isThreat) {
+  synchronized(trackLock) {
+    for (Track t : tracks) {
+      if (abs(t.angle - angle) < 10 && abs(t.distance - distance) < 5) {
+        t.update(angle, distance, radarCenterX, radarCenterY, MAX_RANGE_CM, radarRadius);
+        t.isThreat = isThreat || t.isThreat;
+        return;
+      }
+    }
+    
+    Track newTrack = new Track(tracks.size() + 1, angle, distance);
+    newTrack.update(angle, distance, radarCenterX, radarCenterY, MAX_RANGE_CM, radarRadius);
+    newTrack.isThreat = isThreat;
+    tracks.add(newTrack);
+    
+    if (tracks.size() > 20) {
+      tracks.remove(0);
+    }
+  }
+}
+
+void cleanupTracks(int now) {
+  synchronized(trackLock) {
+    for (int i = tracks.size() - 1; i >= 0; i--) {
+      if (now - tracks.get(i).timestamp > TRACK_MAX_AGE) {
+        tracks.remove(i);
+      }
+    }
+  }
+}
+
+// ============================================================
+// TTS (Runs in background thread)
+// ============================================================
+
+void runTTS(String msg) {
+  try {
+    String[] cmd;
+    String os = System.getProperty("os.name").toLowerCase();
+    
+    if (os.contains("win")) {
+      cmd = new String[]{"powershell", "-Command",
+        "Add-Type -AssemblyName System.Speech; " +
+        "$s = New-Object System.Speech.Synthesis.SpeechSynthesizer; " +
+        "$s.Speak('" + msg + "')"};
+    } else if (os.contains("mac")) {
+      cmd = new String[]{"say", msg};
+    } else {
+      cmd = new String[]{"espeak", msg};
+    }
+    
+    ProcessBuilder pb = new ProcessBuilder(cmd);
+    pb.inheritIO();
+    Process p = pb.start();
+    p.waitFor();
+    
+    println("TTS completed: " + msg);
+    
+  } catch (Exception e) {
+    println("TTS Error: " + e.getMessage());
+  }
+}
+
+// ============================================================
+// INPUT
+// ============================================================
+
+void keyPressed() {
+  if (key == 'r' || key == 'R') {
+    synchronized(trackLock) {
+      tracks.clear();
+    }
+    println("Tracks reset");
+  }
+  if (key == 't' || key == 'T') {
+    threatActive = true;
+    threatStartTime = millis();
+    threatAngle = int(random(180));
+    threatDistance = int(random(5, 35));
+    addTrack(threatAngle, threatDistance, true);
+    
+    if (ttsReady && millis() - lastTTSTime > TTS_COOLDOWN) {
+      lastTTSTime = millis();
+      ttsReady = false;
+      final String msg = "Hostile contact, bearing " + threatAngle + ", range " + threatDistance + " centimeters";
+      ttsExecutor.execute(new Runnable() {
+        public void run() {
+          runTTS(msg);
+          ttsReady = true;
+        }
+      });
+    }
+  }
+  if (key == 's' || key == 'S') {
+    ttsReady = !ttsReady;
+  }
+}
+
+// ============================================================
+// CLASSES
+// ============================================================
+
+class Track {
+  int id;
+  int angle;
+  int distance;
+  volatile int timestamp;
+  volatile boolean isThreat;
+  ArrayList<PVector> history;
+  
+  Track(int id, int angle, int distance) {
+    this.id = id;
+    this.angle = angle;
+    this.distance = distance;
+    this.timestamp = millis();
+    this.isThreat = false;
+    this.history = new ArrayList<PVector>();
+  }
+  
+  void update(int newAngle, int newDistance, float cx, float cy, int maxRange, float maxRadius) {
+    this.angle = newAngle;
+    this.distance = newDistance;
+    this.timestamp = millis();
+    
+    float r = map(newDistance, 0, maxRange, 0, maxRadius);
+    float a = radians(newAngle);
+    float x = cx + cos(a) * r;
+    float y = cy - sin(a) * r;
+    
+    history.add(new PVector(x, y));
+    if (history.size() > 10) {
+      history.remove(0);
+    }
+  }
+}
+
+class Threat {
+  int angle, distance, timestamp;
+  Threat(int a, int d, int t) {
+    angle = a; distance = d; timestamp = t;
+  }
+}
+
+// ============================================================
+// CLEANUP ON EXIT
+// ============================================================
+
+void stop() {
+  ttsExecutor.shutdown();
+  super.stop();
+}
